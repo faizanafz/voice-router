@@ -16,7 +16,6 @@ import pathlib
 import socket
 import subprocess
 import tempfile
-import threading
 
 import httpx
 from fastmcp import FastMCP
@@ -38,13 +37,17 @@ log = logging.getLogger(__name__)
 # Shared state — session_id → asyncio.Queue[str]
 _sessions: dict[str, asyncio.Queue] = {}
 _priority: list[str] = []  # registration order (fallback)
-_focused_session: str | None = None  # last session to call converse() — gets next transcript
-_state_lock = threading.Lock()
+_focused_session: str | None = None  # gets next transcript
+_session_locked: bool = False  # True after explicit SELECT_SESSION; converse() won't override focus
+_state_lock = asyncio.Lock()
+_active_waiters: int = 0  # count of sessions actively blocked in queue.get()
+
+WAITERS_FLAG = ROUTER_DIR / "active-waiters"  # daemon reads this to suppress idle notifications
 
 
-def _next_session() -> str | None:
+async def _next_session() -> str | None:
     global _focused_session
-    with _state_lock:
+    async with _state_lock:
         if not _priority:
             return None
         # Prefer the focused (most recently active) session if it's still registered
@@ -68,30 +71,51 @@ async def dispatch_listener():
         # Session-switch command from daemon: __SELECT_SESSION:N (1-based index)
         if transcript.startswith("__SELECT_SESSION:"):
             try:
-                idx = int(transcript.split(":", 1)[1]) - 1
+                n = int(transcript.split(":", 1)[1])
             except (ValueError, IndexError):
                 log.warning("Bad SELECT_SESSION command: %r", transcript)
                 return
-            with _state_lock:
-                if 0 <= idx < len(_priority):
-                    global _focused_session
-                    _focused_session = _priority[idx]
-                    target_id = _focused_session
-                    queue = _sessions.get(target_id)
+
+            if n < 0:
+                log.warning("SELECT_SESSION number must be >= 0, got %d", n)
+                return
+
+            async with _state_lock:
+                # Match by ccd session number (e.g. "0" for "session 0"), then pane ID ("%0"), then priority index
+                str_id = str(n)
+                pane_id = f"%{n}"
+                if str_id in _sessions:
+                    target_id = str_id
+                elif pane_id in _sessions:
+                    target_id = pane_id
+                elif n < len(_priority):
+                    target_id = _priority[n]
                 else:
-                    log.warning("SELECT_SESSION index %d out of range (%d sessions)", idx + 1, len(_priority))
+                    n_sessions = len(_priority)
+                    log.warning("SELECT_SESSION %d not found (%d sessions: %s)", n, n_sessions, _priority)
+                    subprocess.Popen(
+                        ["notify-send", "-u", "normal", "-t", "3000", "Voice Router",
+                         f"Session {n} not found ({n_sessions} registered)"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
                     return
-            log.info("Focused session switched to %r (index %d)", target_id, idx + 1)
+
+                global _focused_session, _session_locked
+                _focused_session = target_id
+                _session_locked = True
+                queue = _sessions.get(target_id)
+
+            log.info("Focused session locked to %r (number %d)", target_id, n)
             if queue is not None:
                 await queue.put(f"[SELECTED] You are now the active session.")
             return
 
-        target = _next_session()
+        target = await _next_session()
         if target is None:
             log.info("No sessions registered — dropping: %r", transcript)
             return
 
-        with _state_lock:
+        async with _state_lock:
             queue = _sessions.get(target)
 
         if queue is None:
@@ -107,7 +131,12 @@ async def dispatch_listener():
         await server.serve_forever()
 
 
+TTS_PLAYING_FLAG = ROUTER_DIR / "tts-playing"
+
+
 async def speak(text: str):
+    # Set the flag immediately so the daemon aborts recording during Kokoro fetch (not just during paplay)
+    TTS_PLAYING_FLAG.touch()
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -118,13 +147,11 @@ async def speak(text: str):
             wav_bytes = resp.content
     except Exception as e:
         log.warning("TTS failed: %s", e)
+        TTS_PLAYING_FLAG.unlink(missing_ok=True)
         return
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _play_wav, wav_bytes)
-
-
-TTS_PLAYING_FLAG = ROUTER_DIR / "tts-playing"
 
 
 def _play_wav(wav_bytes: bytes):
@@ -132,7 +159,6 @@ def _play_wav(wav_bytes: bytes):
         f.write(wav_bytes)
         tmp = f.name
     try:
-        TTS_PLAYING_FLAG.touch()
         subprocess.run(["paplay", tmp], check=False)
     finally:
         TTS_PLAYING_FLAG.unlink(missing_ok=True)
@@ -152,7 +178,23 @@ async def register_session(session_id: str) -> str:
     Args:
         session_id: Unique identifier for this session (e.g. "pane-0", "%3").
     """
-    with _state_lock:
+    async with _state_lock:
+        # Auto-remove equivalent stale sessions (e.g. "0"↔"%0" are the same CCD session under different naming methods)
+        equivalents: list[str] = []
+        if session_id.isdigit():
+            equivalents = [f"%{session_id}"]
+        elif session_id.startswith("%") and session_id[1:].isdigit():
+            equivalents = [session_id[1:]]
+        for stale in equivalents:
+            if stale in _sessions:
+                log.info("Removing stale equivalent session %r (replaced by %r)", stale, session_id)
+                _sessions.pop(stale)
+                if stale in _priority:
+                    _priority.remove(stale)
+                global _focused_session
+                if _focused_session == stale:
+                    _focused_session = None
+
         if session_id in _sessions:
             return f"Session {session_id!r} already registered."
         _sessions[session_id] = asyncio.Queue()
@@ -166,7 +208,7 @@ async def register_session(session_id: str) -> str:
 @mcp.tool()
 async def unregister_session(session_id: str) -> str:
     """Unregister a session from voice routing."""
-    with _state_lock:
+    async with _state_lock:
         _sessions.pop(session_id, None)
         if session_id in _priority:
             _priority.remove(session_id)
@@ -195,7 +237,7 @@ async def converse(
         skip_tts: Skip speaking (just listen).
         timeout: Seconds to wait for a transcript before giving up.
     """
-    with _state_lock:
+    async with _state_lock:
         queue = _sessions.get(session_id)
 
     if queue is None:
@@ -207,15 +249,24 @@ async def converse(
     if not wait_for_response:
         return "Message spoken."
 
-    # Mark this session as focused so it gets the next transcript
-    global _focused_session
-    with _state_lock:
-        _focused_session = session_id
+    # Mark this session as focused so it gets the next transcript (unless locked by SELECT_SESSION)
+    global _focused_session, _session_locked
+    async with _state_lock:
+        if not _session_locked:
+            _focused_session = session_id
 
+    global _active_waiters
+    _active_waiters += 1
+    WAITERS_FLAG.touch()
     try:
         text = await asyncio.wait_for(queue.get(), timeout=timeout)
     except asyncio.TimeoutError:
         return f"[No response — timeout after {timeout}s]"
+    finally:
+        _active_waiters -= 1
+        if _active_waiters <= 0:
+            _active_waiters = 0
+            WAITERS_FLAG.unlink(missing_ok=True)
 
     return f"Voice response: {text}"
 
@@ -223,7 +274,7 @@ async def converse(
 @mcp.tool()
 async def session_status() -> str:
     """Show currently registered sessions and priority order."""
-    with _state_lock:
+    async with _state_lock:
         sessions = list(_priority)
         focused = _focused_session
 

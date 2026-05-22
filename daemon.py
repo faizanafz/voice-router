@@ -38,7 +38,8 @@ MAX_DURATION_S = 45.0
 WHISPER_URL = os.environ.get("VOICE_ROUTER_WHISPER_URL", "http://127.0.0.1:2022/v1/audio/transcriptions")
 WHISPER_LANGUAGE = os.environ.get("VOICE_ROUTER_LANGUAGE", "en")
 TTS_PLAYING_FLAG = ROUTER_DIR / "tts-playing"
-TTS_POST_SILENCE_S = 0.8  # extra silence after TTS before listening
+WAITERS_FLAG = ROUTER_DIR / "active-waiters"
+TTS_POST_SILENCE_S = 2.0  # extra silence after TTS before listening (room reverb needs time to die)
 
 
 def dispatch(transcript: str):
@@ -123,35 +124,39 @@ def transcribe(audio: np.ndarray) -> str:
         )
     resp.raise_for_status()
     text = resp.json().get("text", "").strip()
-    text = re.sub(r'\[BLANK_AUDIO\]|\[INAUDIBLE\]|\[\s*[Ss]ilence\s*\]|>>\s*', '', text).strip()
+    text = re.sub(r'\[BLANK_AUDIO\]|\[INAUDIBLE\]|\[No audio\]|\[\s*[Ss]ilence\s*\]|>>\s*', '', text).strip()
     return text
 
 
-_NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+_NUMBER_WORDS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
                  "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
 
 _SESSION_SWITCH_RE = re.compile(
-    r'\bsession\s+(?P<n>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b',
+    r'\bsession\s+(?P<n>\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten)\b',
     re.IGNORECASE,
 )
 
 
 def parse_session_switch(text: str) -> tuple[int, str] | None:
-    """Return (1-based session index, remaining message) if text starts with a session address, else None.
+    """Return (0-based session index, remaining message) if text starts with a session address, else None.
 
-    "Session 1, how are you?" → (1, "how are you?")
+    "Session 0, how are you?" → (0, "how are you?")
     "Session one" → (1, "")
     """
-    m = _SESSION_SWITCH_RE.match(text.strip())
+    m = _SESSION_SWITCH_RE.search(text.strip())
     if not m:
         return None
     raw = m.group("n").lower()
-    n = _NUMBER_WORDS.get(raw) or int(raw)
-    if n < 1:
-        log.warning("Session index must be >= 1, got %d — ignoring", n)
+    n = _NUMBER_WORDS.get(raw) if raw in _NUMBER_WORDS else int(raw)
+    if n < 0:
+        log.warning("Session index must be >= 0, got %d — ignoring", n)
         return None
+    # remainder = everything after the matched phrase (skip any leading punctuation/spaces)
     remainder = text[m.end():].lstrip(" ,;:").strip()
     return n, remainder
+
+
+NOTIFY_COOLDOWN_S = 5.0  # suppress "Your turn" for this many seconds after a transcript is dispatched
 
 
 def main():
@@ -159,6 +164,8 @@ def main():
     log.info("Voice Router Daemon started")
     log.info("Whisper: %s  Language: %s", WHISPER_URL, WHISPER_LANGUAGE)
     log.info("Dispatch socket: %s", DISPATCH_SOCKET)
+
+    last_dispatch_time: float = 0.0
 
     while True:
         try:
@@ -168,11 +175,15 @@ def main():
             if TTS_POST_SILENCE_S > 0:
                 time.sleep(TTS_POST_SILENCE_S)
 
-            # Notify user it's their turn
-            subprocess.Popen(
-                ["notify-send", "-u", "low", "-t", "2000", "Voice Router", "Your turn"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            # Only notify when a session is actively waiting AND enough time has passed since last dispatch
+            # (suppresses the "Your turn" flash that appears right after the user just spoke)
+            since_dispatch = time.monotonic() - last_dispatch_time
+            if WAITERS_FLAG.exists() and since_dispatch >= NOTIFY_COOLDOWN_S:
+                subprocess.Popen(
+                    ["notify-send", "-u", "low", "-t", "2000", "Voice Router", "Your turn",
+                     "-h", "string:x-canonical-private-synchronous:voicerouter"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
 
             audio = record()
             if audio is _TTS_ABORT:
@@ -182,10 +193,11 @@ def main():
                 time.sleep(TTS_POST_SILENCE_S)
                 continue
             if audio is None:
-                subprocess.Popen(
-                    ["notify-send", "-u", "low", "-t", "3000", "Voice Router", "No speech detected"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
+                if WAITERS_FLAG.exists() and since_dispatch >= NOTIFY_COOLDOWN_S:
+                    subprocess.Popen(
+                        ["notify-send", "-u", "low", "-t", "3000", "Voice Router", "No speech detected"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
                 continue
 
             log.info("Transcribing…")
@@ -197,17 +209,22 @@ def main():
             log.info("Transcript: %r", text)
             switch = parse_session_switch(text)
             if switch is not None:
+                # Session switch commands always processed regardless of waiter state
                 session_index, remainder = switch
-                log.info("Session switch → session %d, remainder: %r", session_index, remainder)
+                log.info("Session switch → session %d (0-based), remainder: %r", session_index, remainder)
                 subprocess.Popen(
                     ["notify-send", "-u", "low", "-t", "2000", "Voice Router", f"Switching to session {session_index}"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
                 dispatch(f"__SELECT_SESSION:{session_index}")
-                if remainder:
+                if remainder and WAITERS_FLAG.exists():
                     dispatch(remainder)
-            else:
+            elif WAITERS_FLAG.exists():
+                # Only dispatch regular transcripts when a session is actively waiting
+                last_dispatch_time = time.monotonic()
                 dispatch(text)
+            else:
+                log.info("No active waiter — dropping transcript: %r", text)
 
         except KeyboardInterrupt:
             log.info("Stopped.")
