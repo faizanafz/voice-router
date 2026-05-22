@@ -39,7 +39,7 @@ WHISPER_URL = os.environ.get("VOICE_ROUTER_WHISPER_URL", "http://127.0.0.1:2022/
 WHISPER_LANGUAGE = os.environ.get("VOICE_ROUTER_LANGUAGE", "en")
 TTS_PLAYING_FLAG = ROUTER_DIR / "tts-playing"
 WAITERS_FLAG = ROUTER_DIR / "active-waiters"
-TTS_POST_SILENCE_S = 2.0  # extra silence after TTS before listening (room reverb needs time to die)
+TTS_POST_SILENCE_S = 0.8  # extra silence after TTS before listening
 
 
 def dispatch(transcript: str):
