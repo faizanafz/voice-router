@@ -1,0 +1,16 @@
+[Unit]
+Description=Voice Router MCP Server (shared multi-session endpoint)
+After=voicemode-kokoro.service
+
+[Service]
+Type=simple
+ExecStart=/home/faizan/Projects/voice-router/start-session.sh
+Restart=on-failure
+RestartSec=5
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voice-router-mcp
+
+[Install]
+WantedBy=default.target

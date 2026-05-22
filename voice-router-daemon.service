@@ -1,0 +1,16 @@
+[Unit]
+Description=Voice Router Daemon (audio capture + dispatch)
+After=voicemode-whisper.service
+
+[Service]
+Type=simple
+ExecStart=/home/faizan/Projects/voice-router/start-daemon.sh
+Restart=on-failure
+RestartSec=5
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voice-router-daemon
+
+[Install]
+WantedBy=default.target
