@@ -5,6 +5,7 @@ import io
 import logging
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import time
@@ -122,7 +123,6 @@ def transcribe(audio: np.ndarray) -> str:
         )
     resp.raise_for_status()
     text = resp.json().get("text", "").strip()
-    import re
     text = re.sub(r'\[BLANK_AUDIO\]|\[INAUDIBLE\]|\[\s*[Ss]ilence\s*\]|>>\s*', '', text).strip()
     return text
 
@@ -136,13 +136,22 @@ _SESSION_SWITCH_RE = re.compile(
 )
 
 
-def parse_session_switch(text: str) -> int | None:
-    """Return 1-based session index if text is a session-switch command, else None."""
-    m = _SESSION_SWITCH_RE.search(text)
+def parse_session_switch(text: str) -> tuple[int, str] | None:
+    """Return (1-based session index, remaining message) if text starts with a session address, else None.
+
+    "Session 1, how are you?" → (1, "how are you?")
+    "Session one" → (1, "")
+    """
+    m = _SESSION_SWITCH_RE.match(text.strip())
     if not m:
         return None
     raw = m.group("n").lower()
-    return _NUMBER_WORDS.get(raw) or int(raw)
+    n = _NUMBER_WORDS.get(raw) or int(raw)
+    if n < 1:
+        log.warning("Session index must be >= 1, got %d — ignoring", n)
+        return None
+    remainder = text[m.end():].lstrip(" ,;:").strip()
+    return n, remainder
 
 
 def main():
@@ -186,10 +195,17 @@ def main():
                 continue
 
             log.info("Transcript: %r", text)
-            session_index = parse_session_switch(text)
-            if session_index is not None:
-                log.info("Session switch command → session %d", session_index)
+            switch = parse_session_switch(text)
+            if switch is not None:
+                session_index, remainder = switch
+                log.info("Session switch → session %d, remainder: %r", session_index, remainder)
+                subprocess.Popen(
+                    ["notify-send", "-u", "low", "-t", "2000", "Voice Router", f"Switching to session {session_index}"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
                 dispatch(f"__SELECT_SESSION:{session_index}")
+                if remainder:
+                    dispatch(remainder)
             else:
                 dispatch(text)
 
