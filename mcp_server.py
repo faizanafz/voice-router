@@ -37,20 +37,20 @@ log = logging.getLogger(__name__)
 
 # Shared state — session_id → asyncio.Queue[str]
 _sessions: dict[str, asyncio.Queue] = {}
-_priority: list[str] = []  # ordered round-robin
-_priority_idx: int = 0
+_priority: list[str] = []  # registration order (fallback)
+_focused_session: str | None = None  # last session to call converse() — gets next transcript
 _state_lock = threading.Lock()
 
 
 def _next_session() -> str | None:
-    global _priority_idx
+    global _focused_session
     with _state_lock:
         if not _priority:
             return None
-        idx = _priority_idx % len(_priority)
-        session_id = _priority[idx]
-        _priority_idx = (idx + 1) % len(_priority)
-        return session_id
+        # Prefer the focused (most recently active) session if it's still registered
+        if _focused_session and _focused_session in _priority:
+            return _focused_session
+        return _priority[0]
 
 
 async def dispatch_listener():
@@ -63,6 +63,27 @@ async def dispatch_listener():
         writer.close()
 
         if not transcript:
+            return
+
+        # Session-switch command from daemon: __SELECT_SESSION:N (1-based index)
+        if transcript.startswith("__SELECT_SESSION:"):
+            try:
+                idx = int(transcript.split(":", 1)[1]) - 1
+            except (ValueError, IndexError):
+                log.warning("Bad SELECT_SESSION command: %r", transcript)
+                return
+            with _state_lock:
+                if 0 <= idx < len(_priority):
+                    global _focused_session
+                    _focused_session = _priority[idx]
+                    target_id = _focused_session
+                    queue = _sessions.get(target_id)
+                else:
+                    log.warning("SELECT_SESSION index %d out of range (%d sessions)", idx + 1, len(_priority))
+                    return
+            log.info("Focused session switched to %r (index %d)", target_id, idx + 1)
+            if queue is not None:
+                await queue.put(f"[SELECTED] You are now the active session.")
             return
 
         target = _next_session()
@@ -87,13 +108,17 @@ async def dispatch_listener():
 
 
 async def speak(text: str):
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            KOKORO_URL,
-            json={"model": "kokoro", "input": text, "voice": KOKORO_VOICE, "response_format": "wav"},
-        )
-        resp.raise_for_status()
-        wav_bytes = resp.content
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                KOKORO_URL,
+                json={"model": "kokoro", "input": text, "voice": KOKORO_VOICE, "response_format": "wav"},
+            )
+            resp.raise_for_status()
+            wav_bytes = resp.content
+    except Exception as e:
+        log.warning("TTS failed: %s", e)
+        return
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _play_wav, wav_bytes)
@@ -156,7 +181,7 @@ async def converse(
     session_id: str,
     wait_for_response: bool = True,
     skip_tts: bool = False,
-    timeout: float = 120.0,
+    timeout: float = 3600.0,
 ) -> str:
     """Speak a message and wait for the user's voice response (via voice-router daemon).
 
@@ -182,6 +207,11 @@ async def converse(
     if not wait_for_response:
         return "Message spoken."
 
+    # Mark this session as focused so it gets the next transcript
+    global _focused_session
+    with _state_lock:
+        _focused_session = session_id
+
     try:
         text = await asyncio.wait_for(queue.get(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -195,15 +225,15 @@ async def session_status() -> str:
     """Show currently registered sessions and priority order."""
     with _state_lock:
         sessions = list(_priority)
-        idx = _priority_idx % len(_priority) if _priority else 0
+        focused = _focused_session
 
     if not sessions:
         return "No sessions registered."
 
     lines = [f"Registered sessions ({len(sessions)}):"]
-    for i, sid in enumerate(sessions):
-        marker = " ← next" if i == idx else ""
-        lines.append(f"  {i + 1}. {sid}{marker}")
+    for sid in sessions:
+        marker = " ← focused (gets next)" if sid == focused else ""
+        lines.append(f"  - {sid}{marker}")
     return "\n".join(lines)
 
 

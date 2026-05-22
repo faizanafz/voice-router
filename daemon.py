@@ -122,10 +122,27 @@ def transcribe(audio: np.ndarray) -> str:
         )
     resp.raise_for_status()
     text = resp.json().get("text", "").strip()
-    # Strip known Whisper silence/hallucination markers
     import re
     text = re.sub(r'\[BLANK_AUDIO\]|\[INAUDIBLE\]|\[\s*[Ss]ilence\s*\]|>>\s*', '', text).strip()
     return text
+
+
+_NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                 "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+_SESSION_SWITCH_RE = re.compile(
+    r'\bsession\s+(?P<n>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b',
+    re.IGNORECASE,
+)
+
+
+def parse_session_switch(text: str) -> int | None:
+    """Return 1-based session index if text is a session-switch command, else None."""
+    m = _SESSION_SWITCH_RE.search(text)
+    if not m:
+        return None
+    raw = m.group("n").lower()
+    return _NUMBER_WORDS.get(raw) or int(raw)
 
 
 def main():
@@ -169,7 +186,12 @@ def main():
                 continue
 
             log.info("Transcript: %r", text)
-            dispatch(text)
+            session_index = parse_session_switch(text)
+            if session_index is not None:
+                log.info("Session switch command → session %d", session_index)
+                dispatch(f"__SELECT_SESSION:{session_index}")
+            else:
+                dispatch(text)
 
         except KeyboardInterrupt:
             log.info("Stopped.")
