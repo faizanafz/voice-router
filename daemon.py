@@ -37,7 +37,7 @@ MAX_DURATION_S = 45.0
 WHISPER_URL = os.environ.get("VOICE_ROUTER_WHISPER_URL", "http://127.0.0.1:2022/v1/audio/transcriptions")
 WHISPER_LANGUAGE = os.environ.get("VOICE_ROUTER_LANGUAGE", "en")
 TTS_PLAYING_FLAG = ROUTER_DIR / "tts-playing"
-TTS_POST_SILENCE_S = 0.4  # extra silence after TTS before listening
+TTS_POST_SILENCE_S = 0.8  # extra silence after TTS before listening
 
 
 def dispatch(transcript: str):
@@ -86,13 +86,13 @@ def record() -> np.ndarray | None:
             except Exception:
                 is_speech = False
 
-            if elapsed_ms < GRACE_MS:
-                continue
-
-            # Abort recording if TTS starts playing (avoids capturing echo)
+            # Abort recording if TTS starts playing (avoids capturing echo), even during grace
             if TTS_PLAYING_FLAG.exists():
                 log.info("TTS started — aborting recording to avoid echo")
                 return _TTS_ABORT
+
+            if elapsed_ms < GRACE_MS:
+                continue
 
             if is_speech:
                 speech_started = True
@@ -121,7 +121,11 @@ def transcribe(audio: np.ndarray) -> str:
             data={"model": "whisper-1", "language": WHISPER_LANGUAGE},
         )
     resp.raise_for_status()
-    return resp.json().get("text", "").strip()
+    text = resp.json().get("text", "").strip()
+    # Strip known Whisper silence/hallucination markers
+    import re
+    text = re.sub(r'\[BLANK_AUDIO\]|\[INAUDIBLE\]|\[\s*[Ss]ilence\s*\]|>>\s*', '', text).strip()
+    return text
 
 
 def main():
@@ -133,21 +137,23 @@ def main():
     while True:
         try:
             # Wait for any TTS playback to finish before recording
-            was_tts = TTS_PLAYING_FLAG.exists()
             while TTS_PLAYING_FLAG.exists():
                 time.sleep(0.05)
             if TTS_POST_SILENCE_S > 0:
                 time.sleep(TTS_POST_SILENCE_S)
 
-            # Notify user it's their turn (only after TTS, not on every cycle)
-            if was_tts:
-                subprocess.Popen(
-                    ["notify-send", "-u", "low", "-t", "2000", "Voice Router", "Your turn"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
+            # Notify user it's their turn
+            subprocess.Popen(
+                ["notify-send", "-u", "low", "-t", "2000", "Voice Router", "Your turn"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
 
             audio = record()
             if audio is _TTS_ABORT:
+                # TTS was detected mid-recording; ensure we wait for it to finish
+                while TTS_PLAYING_FLAG.exists():
+                    time.sleep(0.05)
+                time.sleep(TTS_POST_SILENCE_S)
                 continue
             if audio is None:
                 subprocess.Popen(
