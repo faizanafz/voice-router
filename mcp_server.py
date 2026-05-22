@@ -290,6 +290,9 @@ async def session_status() -> str:
 
 def main():
     ROUTER_DIR.mkdir(parents=True, exist_ok=True)
+    # Clean up stale flag files from previous runs so daemon starts in a known state
+    WAITERS_FLAG.unlink(missing_ok=True)
+    TTS_PLAYING_FLAG.unlink(missing_ok=True)
     SESSIONS_DIR.mkdir(exist_ok=True)
     log.info("Voice Router MCP Server starting on port %d", MCP_PORT)
 
