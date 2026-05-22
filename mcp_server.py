@@ -41,6 +41,7 @@ _focused_session: str | None = None  # gets next transcript
 _session_locked: bool = False  # True after explicit SELECT_SESSION; converse() won't override focus
 _state_lock = asyncio.Lock()
 _active_waiters: int = 0  # count of sessions actively blocked in queue.get()
+_pending_tts: dict[str, str] = {}  # session_id → message deferred while session was not focused
 
 WAITERS_FLAG = ROUTER_DIR / "active-waiters"  # daemon reads this to suppress idle notifications
 
@@ -243,14 +244,30 @@ async def converse(
     if queue is None:
         return f"Session {session_id!r} not registered. Call register_session first."
 
-    if message and not skip_tts:
-        await speak(message)
+    global _pending_tts, _focused_session, _session_locked
+
+    if not skip_tts:
+        # Play any message deferred from when this session wasn't focused
+        async with _state_lock:
+            deferred = _pending_tts.pop(session_id, None)
+        if deferred:
+            await speak(deferred)
+
+        if message:
+            # Only play TTS immediately if session lock isn't held by another session
+            async with _state_lock:
+                other_has_lock = _session_locked and _focused_session != session_id
+            if other_has_lock:
+                async with _state_lock:
+                    _pending_tts[session_id] = message
+                log.info("Session %r not focused — deferring TTS until focus returns", session_id)
+            else:
+                await speak(message)
 
     if not wait_for_response:
         return "Message spoken."
 
     # Mark this session as focused so it gets the next transcript (unless locked by SELECT_SESSION)
-    global _focused_session, _session_locked
     async with _state_lock:
         if not _session_locked:
             _focused_session = session_id
